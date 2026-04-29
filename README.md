@@ -33,4 +33,4 @@ The script expects these two dataset files in the project root:
 
 For each course, the morning sheet is used as training data and the afternoon sheet is used as testing data. The target is the final `Total` score out of 100. Separate models are trained after the 5th, 6th, 7th, and later activities until the second-last activity.
 
-For every prediction horizon, the script compares Ridge Regression, Random Forest, and Gradient Boosting with 5-fold cross-validation on the training set, then uses the best model to predict the afternoon students' final scores.
+For every prediction horizon, the script predicts the remaining-score ratio and adds it to the marks already earned by the known activities. Cloud Computing uses a Random Forest remaining-ratio model, while ICT uses an Elastic Net remaining-ratio model. A conservative engagement fallback is applied when a student has extremely low earned marks and mostly missing/zero known activities.

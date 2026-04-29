@@ -23,10 +23,10 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from sklearn.base import clone
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import KFold, cross_val_score
+from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -47,6 +47,10 @@ class CourseConfig:
     scale_row: int = 2
     data_start_row: int = 3
     id_col: int = 1
+    model_strategy: str = "ridge_remaining_ratio"
+    dropout_start_horizon: int = 8
+    dropout_earned_threshold: float = 3.0
+    dropout_missing_zero_threshold: float = 0.5
 
 
 @dataclass
@@ -67,6 +71,10 @@ COURSES = [
         train_sheet="cloud computing morning",
         test_sheet="cloud computing afternoon",
         target_col=17,
+        model_strategy="random_forest_remaining_ratio",
+        dropout_start_horizon=7,
+        dropout_earned_threshold=3.0,
+        dropout_missing_zero_threshold=0.9,
     ),
     CourseConfig(
         course_name="ICT",
@@ -74,6 +82,10 @@ COURSES = [
         train_sheet="ICT Morning",
         test_sheet="ICT Afternoon",
         target_col=15,
+        model_strategy="elastic_net_remaining_ratio",
+        dropout_start_horizon=5,
+        dropout_earned_threshold=3.0,
+        dropout_missing_zero_threshold=0.4,
     ),
 ]
 
@@ -175,54 +187,97 @@ def cumulative_earned(dataset: CourseDataset, horizon: int) -> pd.Series:
     return contribution.sum(axis=1)
 
 
-def model_candidates(random_state: int) -> dict[str, object]:
-    return {
-        "Ridge Regression": make_pipeline(StandardScaler(), Ridge(alpha=1.0)),
-        "Random Forest": RandomForestRegressor(
-            n_estimators=180,
-            min_samples_leaf=3,
-            random_state=random_state,
-            n_jobs=-1,
-        ),
-        "Gradient Boosting": GradientBoostingRegressor(
-            n_estimators=160,
-            learning_rate=0.04,
-            max_depth=2,
-            random_state=random_state,
-        ),
-    }
-
-
-def select_model(
-    x_train: pd.DataFrame,
-    y_train: pd.Series,
-    random_state: int,
-) -> tuple[str, object, float]:
-    cv = KFold(n_splits=min(5, len(y_train)), shuffle=True, random_state=random_state)
-    best_name = ""
-    best_model = None
-    best_mae = float("inf")
-
-    for name, model in model_candidates(random_state).items():
-        scores = cross_val_score(
-            model,
-            x_train,
-            y_train,
-            scoring="neg_mean_absolute_error",
-            cv=cv,
-            n_jobs=1,
+def model_for_course(config: CourseConfig, random_state: int) -> tuple[str, object]:
+    if config.model_strategy == "random_forest_remaining_ratio":
+        return (
+            "Remaining-Ratio Random Forest",
+            RandomForestRegressor(
+                n_estimators=120,
+                min_samples_leaf=3,
+                random_state=random_state,
+                n_jobs=-1,
+            ),
         )
-        mae = float(-scores.mean())
-        if mae < best_mae:
-            best_name = name
-            best_model = clone(model)
-            best_mae = mae
 
-    if best_model is None:
-        raise RuntimeError("No model candidate could be selected.")
+    if config.model_strategy == "elastic_net_remaining_ratio":
+        return (
+            "Remaining-Ratio Elastic Net",
+            make_pipeline(
+                StandardScaler(),
+                ElasticNet(alpha=0.1, l1_ratio=0.2, max_iter=5000, random_state=random_state),
+            ),
+        )
 
-    best_model.fit(x_train, y_train)
-    return best_name, best_model, best_mae
+    return (
+        "Remaining-Ratio Ridge Regression",
+        make_pipeline(StandardScaler(), Ridge(alpha=10.0)),
+    )
+
+
+def remaining_ratio_target(dataset: CourseDataset, horizon: int) -> pd.Series:
+    remaining_weight = max(float(dataset.weights.iloc[horizon:].sum()), 1e-9)
+    remaining_marks = (dataset.target - cumulative_earned(dataset, horizon)).clip(lower=0.0)
+    return remaining_marks / remaining_weight
+
+
+def predict_remaining_ratio(
+    model: object,
+    train: CourseDataset,
+    predict_dataset: CourseDataset,
+    horizon: int,
+) -> np.ndarray:
+    x_train = engineered_features(train, horizon)
+    y_train = remaining_ratio_target(train, horizon)
+    x_predict = engineered_features(predict_dataset, horizon)
+    known_marks = cumulative_earned(predict_dataset, horizon).to_numpy(dtype=float)
+    remaining_weight = float(predict_dataset.weights.iloc[horizon:].sum())
+
+    fitted_model = clone(model)
+    fitted_model.fit(x_train, y_train)
+    remaining_ratio = fitted_model.predict(x_predict)
+    predicted = known_marks + remaining_ratio * remaining_weight
+    return np.clip(predicted, known_marks, 100.0)
+
+
+def training_cv_mae_for_strategy(
+    model: object,
+    dataset: CourseDataset,
+    horizon: int,
+    random_state: int,
+) -> float:
+    x_train = engineered_features(dataset, horizon)
+    y_train = remaining_ratio_target(dataset, horizon)
+    cv = KFold(n_splits=min(5, len(y_train)), shuffle=True, random_state=random_state)
+    remaining_weight = float(dataset.weights.iloc[horizon:].sum())
+    known_marks = cumulative_earned(dataset, horizon).to_numpy(dtype=float)
+
+    errors = []
+    for train_idx, validation_idx in cv.split(x_train):
+        fitted_model = clone(model)
+        fitted_model.fit(x_train.iloc[train_idx], y_train.iloc[train_idx])
+        remaining_ratio = fitted_model.predict(x_train.iloc[validation_idx])
+        validation_known = known_marks[validation_idx]
+        predicted = validation_known + remaining_ratio * remaining_weight
+        predicted = np.clip(predicted, validation_known, 100.0)
+        errors.append(mean_absolute_error(dataset.target.iloc[validation_idx], predicted))
+
+    return float(np.mean(errors))
+
+
+def disengaged_students(dataset: CourseDataset, horizon: int) -> pd.Series:
+    config = dataset.config
+    if horizon < config.dropout_start_horizon:
+        return pd.Series(False, index=dataset.features.index)
+
+    known_names = list(dataset.features.columns[:horizon])
+    known_marks = cumulative_earned(dataset, horizon)
+    raw = dataset.features.loc[:, known_names]
+    missing_or_zero_ratio = ((~dataset.observed.loc[:, known_names]) | (raw <= 0)).mean(axis=1)
+
+    return (
+        (known_marks <= config.dropout_earned_threshold)
+        & (missing_or_zero_ratio >= config.dropout_missing_zero_threshold)
+    )
 
 
 def prediction_column_name(horizon: int, activity_name: str, total_activities: int) -> str:
@@ -249,13 +304,14 @@ def predict_course(
     model_records = []
 
     for horizon in prediction_horizons:
-        x_train = engineered_features(train, horizon)
-        x_test = engineered_features(test, horizon)
-        model_name, model, cv_mae = select_model(x_train, train.target, random_state + horizon)
+        model_name, model = model_for_course(train.config, random_state + horizon)
+        cv_mae = training_cv_mae_for_strategy(model, train, horizon, random_state + horizon)
+        predicted = predict_remaining_ratio(model, train, test, horizon)
 
-        predicted = model.predict(x_test)
-        lower_bound = cumulative_earned(test, horizon).to_numpy(dtype=float)
-        predicted = np.clip(predicted, lower_bound, 100.0)
+        disengaged_mask = disengaged_students(test, horizon).to_numpy()
+        known_marks = cumulative_earned(test, horizon).to_numpy(dtype=float)
+        predicted = np.where(disengaged_mask, known_marks, predicted)
+        full_model_name = f"{model_name} + engagement fallback"
 
         activity_name = str(train.features.columns[horizon - 1])
         column_name = prediction_column_name(horizon, activity_name, total_activities)
@@ -265,9 +321,10 @@ def predict_course(
                 "Course": train.config.course_name,
                 "Horizon": horizon,
                 "Activity": activity_name,
-                "Selected Model": model_name,
+                "Selected Model": full_model_name,
                 "Training CV MAE": round(cv_mae, 3),
                 "Test MAE": round(mean_absolute_error(test.target, predicted), 3),
+                "Fallback Count": int(disengaged_mask.sum()),
             }
         )
 
@@ -436,9 +493,9 @@ def write_report(
             [
                 "Objective: Predict each afternoon-section student's final total score using only the assessment activities available after the 5th activity, then after the 6th activity, and so on until the second-last activity.",
                 "Data split: For each course, the morning sheet is used as the training set and the afternoon sheet is used as the test set. The actual score is the Total column out of 100.",
-                "Method: A separate model is trained for every course and activity horizon. Missing activity scores are treated as zero marks. The feature set includes raw scores, score ratios, weighted earned marks, observation flags, cumulative earned marks, and completion ratios.",
-                "Model selection: For every horizon, Ridge Regression, Random Forest, and Gradient Boosting are compared with 5-fold cross-validation on the morning section. The lowest cross-validation MAE model is refit on the full morning section and used for the afternoon predictions.",
-                "Post-processing: Predicted totals are clipped to the valid score range of 0 to 100 and are not allowed to fall below the weighted score already earned by that activity horizon.",
+                "Method: A separate model is trained for every course and activity horizon. The model predicts the student's remaining-score ratio, then adds it to the marks already earned by the known activities. Missing activity scores are treated as zero marks. The feature set includes raw scores, score ratios, weighted earned marks, observation flags, cumulative earned marks, and completion ratios.",
+                "Modeling choices: Cloud Computing uses a Random Forest remaining-ratio model. ICT uses an Elastic Net remaining-ratio model. The training CV MAE column reports 5-fold cross-validation error on the morning section for the selected strategy at each horizon.",
+                "Post-processing: Predicted totals are clipped to the valid score range of 0 to 100 and are not allowed to fall below the weighted score already earned by that activity horizon. A conservative engagement fallback is used for students with extremely low earned marks and mostly missing/zero known activities; for those cases the prediction is set to the current earned marks.",
                 "Student metrics: For each student, absolute errors are calculated across all prediction horizons. The report table shows each student's average, maximum, and minimum absolute error, followed by an AVERAGE row for those three metrics.",
             ],
         )
